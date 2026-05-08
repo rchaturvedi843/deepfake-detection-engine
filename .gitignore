@@ -1,0 +1,10 @@
+*.zip
+dataset/
+__pycache__/
+*.pyc
+ff_faces/
+ff_frames/
+final_dataset/
+archive (1)/
+archive (2)/
+deepfake codes/dataset/

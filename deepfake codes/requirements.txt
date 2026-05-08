@@ -1,0 +1,15 @@
+streamlit
+torch
+torchvision
+torchaudio
+opencv-python
+numpy
+pandas
+pillow
+mediapipe
+reportlab
+scikit-learn
+tqdm
+matplotlib
+seaborn
+plotly
