@@ -54,6 +54,13 @@ streamlit run frontend/streamlit_app.py
 - `deepfake codes/utils/`: Utility scripts for generating reports and managing cache.
 - `deepfake codes/notebooks/`: Jupyter Notebooks used for model exploration and data analysis.
 
+## Datasets
+The models in this project were trained using the following datasets:
+- **FaceForensics++**: A large-scale video dataset for facial manipulation detection. Access can be requested via the [official GitHub repository](https://github.com/ondyari/FaceForensics).
+- **Deepfake Detection Challenge (DFDC)**: A massive dataset of videos containing manipulated faces, available on [Kaggle](https://www.kaggle.com/c/deepfake-detection-challenge/data).
+
+*Note: Due to their large size (several terabytes), these datasets are not included in the repository. Please follow the links above to download them for training or evaluation purposes.*
+
 ## Requirements
 - Python 3.8+
 - PyTorch
