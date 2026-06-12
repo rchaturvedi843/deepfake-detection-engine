@@ -31,6 +31,7 @@ from collections import deque
 
 # ── Settings ─────────────────────────────────────────────
 MODEL_PATH = r"C:\Users\sudhir chaturvedi\Desktop\deepfake dataset\deepfake codes\deepfake_final_model.pth"
+DECISION_THRESHOLD = 0.595    # calibrated decision threshold
 CONFIDENCE_THRESHOLD = 0.65   # only label if model is this confident
 HISTORY_SIZE = 30             # rolling window for smoothing
 PROCESS_EVERY = 3             # analyze every N frames (performance)
@@ -42,13 +43,23 @@ classes = ["Fake", "Real"]
 print("Loading model...")
 try:
     model = models.resnet18(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, 2)
     state = torch.load(MODEL_PATH, map_location=device)
     if isinstance(state, dict) and "model_state_dict" in state:
         state = state["model_state_dict"]
-    model.load_state_dict(state, strict=False)
+    # Auto-detect head architecture from saved weights
+    if any(k.startswith("fc.1.") for k in state.keys()):
+        # Trained with Sequential(Dropout, Linear) head
+        model.fc = nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(model.fc.in_features, 2)
+        )
+        print("  Head: Sequential(Dropout, Linear)")
+    else:
+        model.fc = nn.Linear(model.fc.in_features, 2)
+        print("  Head: Linear")
+    model.load_state_dict(state, strict=True)  # strict=True catches mismatches
     model.eval()
-    print("✅ Model loaded")
+    print("✅ Model loaded successfully")
 except Exception as e:
     print(f"❌ Model load failed: {e}")
     print("Make sure MODEL_PATH is correct")
@@ -63,9 +74,74 @@ transform = transforms.Compose([
 ])
 
 # ── Face Detector ─────────────────────────────────────────
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+class FaceDetector:
+    def __init__(self):
+        self.cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.has_mp = False
+        try:
+            import mediapipe as mp
+            self.mp_face_detection = mp.solutions.face_detection
+            self.has_mp = True
+        except Exception:
+            pass
+
+    def get_face_crop(self, frame: np.ndarray) -> tuple:
+        """Returns (crop, bbox_coords) or (None, None)"""
+        if self.has_mp:
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                with self.mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5) as face_detection:
+                    results = face_detection.process(rgb)
+                    if results.detections:
+                        det = max(results.detections, key=lambda d: d.location_data.relative_bounding_box.width * d.location_data.relative_bounding_box.height)
+                        bbox = det.location_data.relative_bounding_box
+                        h, w, _ = frame.shape
+                        x = max(0, int(bbox.xmin * w))
+                        y = max(0, int(bbox.ymin * h))
+                        box_w = min(w - x, int(bbox.width * w))
+                        box_h = min(h - y, int(bbox.height * h))
+                        
+                        # Add 15% padding to match wider Haar cascade training crop style
+                        padding = int(max(box_w, box_h) * 0.15)
+                        x_min = max(0, x - padding)
+                        y_min = max(0, y - padding)
+                        x_max = min(w, x + box_w + padding)
+                        y_max = min(h, y + box_h + padding)
+                        
+                        crop_w = x_max - x_min
+                        crop_h = y_max - y_min
+                        
+                        # Make crop square
+                        cx = x_min + crop_w // 2
+                        cy = y_min + crop_h // 2
+                        sz = max(crop_w, crop_h)
+                        new_x = max(0, cx - sz // 2)
+                        new_y = max(0, cy - sz // 2)
+                        if new_x + sz > w:
+                            new_x = max(0, w - sz)
+                        if new_y + sz > h:
+                            new_y = max(0, h - sz)
+                        final_sz = min(sz, w - new_x, h - new_y)
+                        
+                        if final_sz >= 60:
+                            return frame[new_y:new_y+final_sz, new_x:new_x+final_sz], (new_x, new_y, final_sz, final_sz)
+            except Exception:
+                pass
+
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = self.cascade.detectMultiScale(gray, 1.1, 5, minSize=(60,60))
+            if len(faces) > 0:
+                x, y, w, h = max(faces, key=lambda f: f[2]*f[3])
+                return frame[y:y+h, x:x+w], (x, y, w, h)
+        except Exception:
+            pass
+
+        return None, None
+
+face_detector = FaceDetector()
 
 # ── Frame Enhancement (lighter version) ──────────────────
 def enhance_frame(frame: np.ndarray) -> np.ndarray:
@@ -79,16 +155,22 @@ def enhance_frame(frame: np.ndarray) -> np.ndarray:
 
 # ── Predict face crop ─────────────────────────────────────
 def predict_face(face_bgr: np.ndarray):
-    """Returns (label, fake_prob, real_prob)"""
+    """Returns (fake_prob, real_prob) with 2-view TTA"""
     rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(rgb)
-    t = transform(pil).unsqueeze(0)
+    pil1 = Image.fromarray(rgb)
+    pil2 = pil1.transpose(Image.FLIP_LEFT_RIGHT)
+    
+    t1 = transform(pil1).unsqueeze(0).to(device)
+    t2 = transform(pil2).unsqueeze(0).to(device)
+    t_batch = torch.cat([t1, t2], dim=0) # shape: (2, 3, 224, 224)
+    
     with torch.no_grad():
-        p = F.softmax(model(t), dim=1)[0]
-    fake_p = p[0].item()
-    real_p = p[1].item()
-    label = classes[0] if fake_p > 0.5 else classes[1]
-    return label, fake_p, real_p
+        p = F.softmax(model(t_batch), dim=1)
+        
+    avg_p = p.mean(dim=0)
+    fake_p = avg_p[0].item()
+    real_p = avg_p[1].item()
+    return fake_p, real_p
 
 
 # ── Draw Overlay ─────────────────────────────────────────
@@ -123,7 +205,7 @@ def draw_overlay(frame, x, y, w, h, label, fake_p, real_p, conf, history):
     # History bar (last 30 predictions)
     bar_x, bar_y = x, y + h + 8
     for i, p in enumerate(list(history)):
-        c = (0, 0, 200) if p > 0.5 else (0, 200, 80)
+        c = (0, 0, 200) if p >= DECISION_THRESHOLD else (0, 200, 80)
         cv2.rectangle(frame, (bar_x + i*6, bar_y), (bar_x + i*6+5, bar_y+8), c, -1)
 
     return frame
@@ -166,20 +248,25 @@ while True:
         fps = 15 / (time.time() - fps_time)
         fps_time = time.time()
 
-    # Enhancement
+    # Enhancement (for display only — prediction uses raw frame)
     display_frame = enhance_frame(frame) if enhance else frame.copy()
 
     # Face detection + prediction (every N frames)
+    # IMPORTANT: detect & predict on RAW frame, not enhanced frame,
+    # because the model was trained on un-enhanced images.
     if frame_count % PROCESS_EVERY == 0:
-        gray = cv2.cvtColor(display_frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60,60))
+        face_crop, bbox = face_detector.get_face_crop(frame)
 
-        if len(faces) > 0:
-            x, y, w, h = max(faces, key=lambda f: f[2]*f[3])
-            face_crop = display_frame[y:y+h, x:x+w]
-            last_label, last_fake_p, last_real_p = predict_face(face_crop)
+        if bbox is not None:
+            x, y, w, h = bbox
+            fake_p, real_p = predict_face(face_crop)
+            history.append(fake_p)
+
+            # Rolling average smoothing
+            last_fake_p = float(np.mean(list(history)))
+            last_real_p = 1.0 - last_fake_p
+            last_label = classes[0] if last_fake_p >= DECISION_THRESHOLD else classes[1]
             last_conf = max(last_fake_p, last_real_p)
-            history.append(last_fake_p)
 
             display_frame = draw_overlay(
                 display_frame, x, y, w, h,
@@ -187,10 +274,10 @@ while True:
             )
     else:
         # Redraw last result on non-processed frames
-        gray = cv2.cvtColor(display_frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.1, 5, minSize=(60,60))
-        if len(faces) > 0:
-            x, y, w, h = max(faces, key=lambda f: f[2]*f[3])
+        # Use raw frame for face detection consistency
+        _, bbox = face_detector.get_face_crop(frame)
+        if bbox is not None:
+            x, y, w, h = bbox
             display_frame = draw_overlay(
                 display_frame, x, y, w, h,
                 last_label, last_fake_p, last_real_p, last_conf, history

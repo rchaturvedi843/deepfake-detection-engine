@@ -31,18 +31,18 @@ try:
     if hasattr(mp, 'solutions'):
         HAS_MEDIAPIPE = True
     else:
-        print("⚠️ MediaPipe installed but solutions module not found")
+        print("[!] MediaPipe installed but solutions module not found")
 except ImportError:
-    print("⚠️ MediaPipe not installed")
+    print("[!] MediaPipe not installed")
 except Exception as e:
-    print(f"⚠️ MediaPipe error: {e}")
+    print(f"[!] MediaPipe error: {e}")
 
 HAS_REPORTLAB = False
 try:
     from reportlab.pdfgen import canvas as rl_canvas
     HAS_REPORTLAB = True
 except ImportError:
-    print("⚠️ ReportLab not installed")
+    print("[!] ReportLab not installed")
 
 # ── Video model import with fallback ─────────────────────
 HAS_VIDEO_PREDICTOR = False
@@ -50,7 +50,7 @@ try:
     from models.video_model.video_predictor import predict_video, get_predictor
     HAS_VIDEO_PREDICTOR = True
 except ImportError:
-    print("⚠️ Video predictor module not found")
+    print("[!] Video predictor module not found")
 
 # ════════════════════════════════════════════════════════════
 #  PAGE CONFIG (OPTIMIZED FOR SPEED)
@@ -299,9 +299,6 @@ def load_image_model(model_name: str):
         m.load_state_dict(state, strict=True)
         m.eval()
         
-        # Disable gradients for faster inference
-        torch.set_grad_enabled(False)
-        
         return m
     except Exception as e:
         st.error(f"❌ Error loading model: {e}")
@@ -332,30 +329,104 @@ def detect_face_cv(image: Image.Image) -> Image.Image:
     )
     faces = cascade.detectMultiScale(gray, 1.3, 5)
     if len(faces) == 0:
-        return image
+        return None
     x, y, w, h = max(faces, key=lambda f: f[2]*f[3])
     return Image.fromarray(img[y:y+h, x:x+w])
 
 
-def predict_image(image: Image.Image, model):
-    """Predict image - Returns (result, confidence%, fake_prob%, real_prob%)"""
+def detect_face_mp(image: Image.Image) -> Image.Image:
+    """Detect face using MediaPipe for high robustness with margin padding"""
+    if not HAS_MEDIAPIPE:
+        return None
+    try:
+        img = np.array(image.convert("RGB"))
+        mp_face = mp.solutions.face_detection
+        with mp_face.FaceDetection(model_selection=0, min_detection_confidence=0.5) as face_det:
+            res = face_det.process(img)
+            if not res.detections:
+                return None
+            det = max(res.detections, key=lambda d: d.location_data.relative_bounding_box.width * d.location_data.relative_bounding_box.height)
+            bbox = det.location_data.relative_bounding_box
+            h, w, _ = img.shape
+            x = max(0, int(bbox.xmin * w))
+            y = max(0, int(bbox.ymin * h))
+            bw = min(w - x, int(bbox.width * w))
+            bh = min(h - y, int(bbox.height * h))
+            
+            # Add 15% padding to match wider Haar cascade training crop style
+            padding = int(max(bw, bh) * 0.15)
+            x_min = max(0, x - padding)
+            y_min = max(0, y - padding)
+            x_max = min(w, x + bw + padding)
+            y_max = min(h, y + bh + padding)
+            
+            crop_w = x_max - x_min
+            crop_h = y_max - y_min
+            
+            # Make the crop square
+            cx = x_min + crop_w // 2
+            cy = y_min + crop_h // 2
+            sz = max(crop_w, crop_h)
+            new_x = max(0, cx - sz // 2)
+            new_y = max(0, cy - sz // 2)
+            if new_x + sz > w:
+                new_x = max(0, w - sz)
+            if new_y + sz > h:
+                new_y = max(0, h - sz)
+            final_sz = min(sz, w - new_x, h - new_y)
+            
+            if final_sz <= 0:
+                return None
+            return Image.fromarray(img[new_y:new_y+final_sz, new_x:new_x+final_sz])
+    except Exception as e:
+        print(f"MediaPipe face detection error: {e}")
+        return None
+
+
+def get_face_cropped(image: Image.Image) -> tuple:
+    """Detect and crop face using MediaPipe first, falling back to Haar Cascade"""
+    face = detect_face_mp(image)
+    if face is not None:
+        return face, True
+    face = detect_face_cv(image)
+    if face is not None:
+        return face, True
+    return image, False
+
+
+def predict_image(image: Image.Image, model, threshold: float = CALIBRATED_IMAGE_THRESHOLD):
+    """Predict image with 2-view TTA - Returns (result, confidence%, fake_prob%, real_prob%)"""
     if model is None:
         return None, 0, 0, 0
     
-    tensor = TRANSFORM(image.convert("RGB")).unsqueeze(0).to(device)
+    # View 1: Original
+    img1 = image.convert("RGB")
+    t1 = TRANSFORM(img1).unsqueeze(0).to(device)
+    
+    # View 2: Horizontally Flipped
+    img2 = img1.transpose(Image.FLIP_LEFT_RIGHT)
+    t2 = TRANSFORM(img2).unsqueeze(0).to(device)
+    
+    t_batch = torch.cat([t1, t2], dim=0) # shape: (2, 3, 224, 224)
+    
     with torch.no_grad():
         if isinstance(model, tuple):
-            probs = sum(
-                weight * torch.softmax(loaded_model(tensor), dim=1)
-                for loaded_model, weight in model
-            )
+            probs_list = []
+            for loaded_model, weight in model:
+                out = loaded_model(t_batch)
+                p = torch.softmax(out, dim=1)
+                probs_list.append(weight * p)
+            probs = sum(probs_list)
         else:
-            out = model(tensor)
+            out = model(t_batch)
             probs = torch.softmax(out, dim=1)
+            
+    # Average across the 2 views (original + flipped)
+    avg_probs = probs.mean(dim=0)
     
-    fake_prob = probs[0][0].item()
-    real_prob = probs[0][1].item()
-    result = "Fake" if fake_prob >= CALIBRATED_IMAGE_THRESHOLD else "Real"
+    fake_prob = avg_probs[0].item()
+    real_prob = avg_probs[1].item()
+    result = "Fake" if fake_prob >= threshold else "Real"
     confidence = max(fake_prob, real_prob)
     return (result, confidence * 100, fake_prob * 100, real_prob * 100)
 
@@ -607,6 +678,7 @@ with st.sidebar:
     use_face  = st.checkbox("Face detection", value=True)
 
     st.markdown("**Image Settings**")
+    use_face_img   = st.checkbox("Face detection / cropping", value=True, help="Disable this if your uploaded image is already a cropped face to prevent double-cropping.")
     show_gradcam   = st.checkbox("GradCAM heatmap",   value=False)
     show_landmarks = st.checkbox("Face landmarks",     value=False)
     show_fft       = st.checkbox("FFT analysis",       value=False)
@@ -681,10 +753,17 @@ with tab_img:
         if uploaded_img and analyze_img:
             image = Image.open(uploaded_img).convert("RGB")
             with st.spinner("🔍 Analyzing image..."):
-                face_img = detect_face_cv(image)
-                result, conf, fake_p, real_p = predict_image(face_img, model)
+                if use_face_img:
+                    face_img, face_found = get_face_cropped(image)
+                else:
+                    face_img, face_found = image, False
+                result, conf, fake_p, real_p = predict_image(face_img, model, threshold=threshold)
 
             if result is not None:
+                if use_face_img and not face_found:
+                    st.warning("⚠️ No face detected in the image. Predicting on the entire image. Results may be less accurate.")
+                elif not use_face_img:
+                    st.info("ℹ️ Predicting on the entire image (face detection/cropping disabled). Make sure the image is already cropped to a face for best results.")
                 show_result(result, fake_p, "high" if conf > 80 else "medium" if conf > 60 else "low")
                 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -915,6 +994,9 @@ with tab_cam:
     if capture_btn:
         cap = cv2.VideoCapture(0)
         if cap.isOpened():
+            # Warm up camera to allow auto-exposure to adjust
+            for _ in range(12):
+                cap.read()
             ret, frame = cap.read()
             cap.release()
             if ret:
@@ -923,10 +1005,17 @@ with tab_cam:
                 cam_img_placeholder.image(rgb, caption="Captured frame",
                                           use_container_width=True)
                 with st.spinner("🔍 Analyzing..."):
-                    face = detect_face_cv(pil)
-                    result, conf, fake_p, real_p = predict_image(face, model)
+                    if use_face_img:
+                        face, face_found = get_face_cropped(pil)
+                    else:
+                        face, face_found = pil, False
+                    result, conf, fake_p, real_p = predict_image(face, model, threshold=threshold)
                 if result is not None:
                     with cam_result_placeholder.container():
+                        if use_face_img and not face_found:
+                            st.warning("⚠️ No face detected in captured frame. Results may be less accurate.")
+                        elif not use_face_img:
+                            st.info("ℹ️ Face cropping disabled. Predicting on the entire frame.")
                         show_result(result, fake_p,
                             "high" if conf > 80 else "medium" if conf > 60 else "low")
                         st.plotly_chart(make_gauge(fake_p),
